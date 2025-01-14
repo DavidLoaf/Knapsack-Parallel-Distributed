@@ -9,94 +9,129 @@
 
 #define DEFAULT_NUMBER_OF_THREADS "1"
 
-// MACRO for better readability
-#define DP(i, j) dp[(i) * (capacity+1) + (j)]
-
 int world_size;
 int world_rank;
 
 int knapsack_distributed(const std::vector<Item> &items, int capacity)
 {
-  timer total_runtime;
-  total_runtime.start();
-  
-  // define number of items
+
   int n = items.size();
+
+  // calculate the amount of work each process will do
+  std::vector<int> items_per_process(world_size, 0);
+
+  int base_items_per_process = n / world_size;
+  int remainder = n % world_size;
   
-  // define dynamic programming table
-  int *dp = new int[2 * (capacity+1)]();
-
-  //define capacity index ranges for processes:
-  int base_range = capacity / world_size;
-  int remainder = capacity % world_size;
-  std::vector<int> indeces(world_size + 1, 1);
-  indeces[world_size] = capacity + 1;
-
-  for(int i = 1; i < world_size; i++)
+  for(int i = 0; i < world_size; i++)
   {
-    indeces[i] = indeces[i-1] + base_range;
-
-    if(remainder >= 1)
+    if(remainder > 0)
     {
-      indeces[i] += remainder;
+      items_per_process[i] = base_items_per_process + 1;
       remainder--;
     }
+    else
+    {
+      items_per_process[i] = base_items_per_process;
+    }
   }
+
+  int starting_item = 0;
+  for(int i = 0; i < world_rank; i++)
+  {
+    starting_item += items_per_process[i];
+  }
+
+  int chunk_size = capacity / 5;
   
-  // Begin main algorithm
+  // dynamic programing table
+  // Each process only needs the top row from the previous row.
+  //std::vector< std::vector< int >> dp(items_per_process[world_rank] + 1, std::vector<int>(capacity + 1, 0));
+  int *dp = new int[(items_per_process[world_rank]+1)*(capacity+1)]();
+
+  // MACRO for better readability
+  #define DP(i, j) dp[(i) * (capacity+1) + (j)]
+
   timer t1;
   t1.start();
 
-  int i;
-  for (i = 1; i <= n; i++)
+  // ##################################### BEGIN PARALLEL CODE #####################################
+  for (int j = 1; j <= capacity; j++)
   {
-    int top = i % 2;
-    int bottom = top != 1;
-
-    for (int j = indeces[world_rank]; j < indeces[world_rank+1]; j++)
-    {
-      const int weight = items[i-1].weight;
-      const int value = items[i-1].value;
-      const int prev = DP(bottom, j);
-
-      if (weight <= j)
-      {
-        //dp[i][j] = std::max(dp[i-1][j], dp[i-1][j - items[i-1].weight] + items[i-1].value);
-        DP(top, j) = std::max(
-          prev,
-          DP(bottom, j-weight) + value
-        );
-      }
-      else
-      {
-        //dp[i][j] = dp[i-1][j];
-        DP(top, j) = prev;
-      }
-    }
+    
+    int starting_j = j;
 
     if(world_rank != 0)
     {
-      MPI_Recv(&DP(top, 0), indeces[world_rank], MPI_INT, world_rank-1, i, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      //MPI_Recv(&dp[0][starting_j], chunk_size, MPI_INT, world_rank-1, starting_j, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(
+        &DP(0, starting_j),
+        chunk_size,
+        MPI_INT,
+        world_rank-1,
+        starting_j,
+        MPI_COMM_WORLD,
+        MPI_STATUS_IGNORE
+      );
     }
+    // k loop for chunk size.
+    for(int k = 0; k < chunk_size; k++)
+    {
+      // inner loop will do dp[i][start]......dp[i][stop]
+      for (int i = 1; i <= items_per_process[world_rank]; i++) 
+      {
+
+        Item current_item = items[starting_item + i - 1];
+        int weight = current_item.weight;
+        int value = current_item.value; 
+
+        if (items[starting_item + i - 1].weight <= j)
+        {
+          //dp[i][j] = std::max(dp[i-1][j], dp[i-1][j - weight] + value);
+          DP(i, j) = std::max(
+            DP(i-1, j),
+            DP(i-1, j-current_item.weight) + current_item.value
+          );
+        }
+        else
+        {
+          //dp[i][j] = dp[i-1][j];
+          DP(i, j) = DP(i-1, j);
+        }
+
+      }
+
+ // increment j insisde k loop
+      j++;
+    }
+    j--;
+  //int MPI_Send(const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm);
     if(world_rank != world_size - 1)
     {
-      MPI_Send(&DP(top, 0), indeces[world_rank + 1], MPI_INT, world_rank + 1, i, MPI_COMM_WORLD);
+      //MPI_Send(&dp[items_per_process[world_rank]][starting_j], chunk_size, MPI_INT, world_rank + 1, starting_j, MPI_COMM_WORLD);
+      MPI_Send(
+        &DP(items_per_process[world_rank], starting_j),
+        chunk_size,
+        MPI_INT,
+        world_rank+1,
+        starting_j,
+        MPI_COMM_WORLD
+      );
     }
   }
+  
+  //int value = dp[items_per_process[world_rank]][capacity];
+  int value = DP(items_per_process[world_rank], capacity);
+  int max_value;
+
+  MPI_Reduce(&value, &max_value, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+  delete[] dp;
 
   double runtime = t1.stop();
-
-  int index = i % 2;
-  int max_value;
-  int value = DP(index, capacity);
-  MPI_Reduce(&value, &max_value, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
-
-  double total_time = total_runtime.stop();
 
   double* times = new double[world_size];
 
   MPI_Gather(&runtime, 1, MPI_DOUBLE, times, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
 
   if(world_rank == 0)
   {
@@ -110,10 +145,8 @@ int knapsack_distributed(const std::vector<Item> &items, int capacity)
   if(world_rank == 0)
   {
     std::cout << "\nMaximum value achievable: " << max_value << std::endl;
-    std::cout << "Total runtime: " << total_time << " seconds" << std::endl;
+    std::cout << "Total runtime: " << runtime << " seconds" << std::endl;
   }
-
-  delete[] dp;
   
   return max_value;
 }

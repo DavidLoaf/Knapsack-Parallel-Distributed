@@ -16,38 +16,48 @@ int knapsack_serial(const std::vector< Item > &items, int capacity)
 
     // dynamic programing table
     //std::vector< std::vector< int >> dp(n+1, std::vector< int >(capacity+1, 0));
-    int *dp = new int[(n+1) * (capacity+1)]();
+    int *dp = new int[(2 * (capacity+1))]();
 
     // MACRO so that the array indexing is more readable
     #define DP(i, j) dp[(i) * (capacity+1) + (j)]
 
-    for (int i = 1; i <= n; i++)
+    int i;
+    for (i = 1; i <= n; i++)
     {
-        for (int j = 0; j <= capacity; j++)
+        int top = i % 2;
+        int bottom = top != 1;
+
+        for (int j = 1; j <= capacity; j++)
         {
-            if (items[i-1].weight <= j)
-            {
-                //dp[i][j] = std::max(dp[i-1][j], dp[i-1][j - items[i-1].weight] + items[i-1].value);
-                DP(i, j) = std::max(
-                    DP(i-1, j),
-                    DP(i-1, j-items[i-1].weight)+items[i-1].value
-                );
-            }
-            else
-            {
-                //dp[i][j] = dp[i-1][j];
-                DP(i, j) = DP(i-1, j);
-            }
+        const int weight = items[i-1].weight;
+        const int value = items[i-1].value;
+        const int prev = DP(bottom, j);
+
+        if (weight <= j)
+        {
+            //dp[i][j] = std::max(dp[i-1][j], dp[i-1][j - items[i-1].weight] + items[i-1].value);
+            DP(top, j) = std::max(
+            prev,
+            DP(bottom, j-weight) + value
+            );
+        }
+        else
+        {
+            //dp[i][j] = dp[i-1][j];
+            DP(top, j) = prev;
+        }
         }
     }
 
-    int result = DP(n, capacity);
-    delete[] dp;
-
+    int last_index = i % 2;
+    int result = DP(last_index, capacity);
+    
     double runtime = t1.stop();
 
     std::cout << "\nMaximum value achievable: " << result << std::endl;
     std::cout << "Runtime: " << runtime << " seconds" << std::endl;
+
+    delete[] dp;
 
     return result;
 }
@@ -57,7 +67,7 @@ int main(int argc, char **argv)
     cxxopts::Options options("Knapsack_Serial", "Serial implementation of 0/1 knapsack problem");
     
     options.add_options()
-        ("n", "Number of items", cxxopts::value<int>()->default_value("1000000"))
+        ("n", "Number of items", cxxopts::value<int>()->default_value("100000"))
         ("c", "Knapsack capacity", cxxopts::value<int>()->default_value("1000"))
         ("h,help", "Print usage")
         ("t", "Run tests", cxxopts::value< bool >()->default_value("false"));

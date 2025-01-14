@@ -1,252 +1,164 @@
 #include <iostream>
 #include <vector>
 #include <thread>
+#include <atomic>
 
 #include "../core/cxxopts.h"
 #include "../core/utils.h"
 #include "../test/test.h"
 
+// Macro to simplify Dynamic programming traversal
+#define DP(i, j) thread->dp[(i) * (thread->capacity+1) + (j)]
 
-void row_knapsack_function(const std::vector<Item> &items, int capacity, int *dp, int start, int end, CustomBarrier &barrier, double *time, int i)
+// object to handle thread data
+class ThreadData
 {
-    timer t;
-    t.start();
-    int n = items.size();
+    public: 
 
-    #define DP_ROW(i, j) dp[(i) * (capacity+1) + (j)]
+    const std::vector<Item>* items;
+    std::atomic<int>*** rowCheck;
+    int* dp;
+    int start;
+    int end;
+    int capacity;
+    double time;
+    uint32_t id;
+};
+
+void parallel_knapsack_function(void* _arg)
+{
+    
+    timer t;   
+    t.start();
+
+    ThreadData* thread = (ThreadData*)_arg;
+    int n = thread->items->size();
+    (*thread->rowCheck)[0][thread->id] = 1;
 
     for (int i = 1; i <= n; i++)
     {
-        for (int j = start; j <= end; j++)
+        
+        if (thread->id != 0) 
         {
-            const int weight = items[i-1].weight;
-            const int value = items[i-1].value;
-            const int prev = DP_ROW(i-1, j);
+            while ((*thread->rowCheck)[i-1][thread->id-1].load() != 1); // Block 
+        }
 
-            if (items[i-1].weight <= j)
+        for (int j = thread->start; j <= thread->end; j++)
+        {
+            const int weight = (*thread->items)[i-1].weight;
+            const int value = (*thread->items)[i-1].value;
+            const int prev = DP(i-1, j);
+
+            if (weight <= j)
             {
                 //dp[i][j] = std::max(dp[i-1][j], dp[i-1][j - items[i-1].weight] + items[i-1].value);
-                DP_ROW(i, j) = std::max(
+                DP(i, j) = std::max(
                     prev,
-                    DP_ROW(i-1, j-weight) + value
+                    DP(i-1, j-weight) + value
                 );
             }
             else
             {
                 //dp[i][j] = dp[i-1][j];
-                DP_ROW(i, j) = prev;
+                DP(i, j) = prev;
             }
         }
-        barrier.wait();
-    }
-    *time = t.stop();
-}
-
-void column_knapsack_function(const std::vector<Item> &items, int capacity, int *dp, int start, int end, CustomBarrier &barrier, double *time, int threadNum, int nThreads)
-{
-    timer t;
-    t.start();
-    int n = items.size();
-    int overflow = 0;
-
-    #define DP_COL(j, i) dp[(j) * (n+1) + (i)]
-    
-    // stall threads while other work is being done to eliminate communication based on dependencies. 
-    while(overflow < threadNum)
-    {
-        barrier.wait();
-        overflow++;
-    }
-    for (int j = 1; j <= capacity; j++)
-    {
-        
-        for (int i = start; i <= end; i++)
-        {
-            // caching stuff.
-            const int weight = items[i-1].weight;
-            const int value = items[i-1].value;
-            const int prev = DP_COL(j, i-1);
-            
-            if (items[i-1].weight <= j)
-            {
-                
-                //dp[j][i] = std::max(dp[j][i-1], dp[j - items[i-1].weight][i-1] + items[i-1].value);
-                DP_COL(j, i) = std::max(
-                    prev,
-                    DP_COL(j-weight, i-1)+value
-                );
-            }
-            else
-            {
-                //dp[j][i] = dp[j][i-1];
-                DP_COL(j, i) = prev;
-            }
-        }
-        barrier.wait();
+        (*thread->rowCheck)[i][thread->id].store(1);
     }
 
-    while(overflow < nThreads -1)
-    {
-        barrier.wait();
-        overflow++;
-    }
-    *time = t.stop();
+    thread->time = t.stop();
 }
 
 // used pseudocode from:
 // https://en.wikipedia.org/wiki/Knapsack_problem#0-1_knapsack_problem
-int knapsack_parallel(const std::vector< Item > &items, int capacity, uint32_t nThreads) 
+int knapsack_parallel_setup(const std::vector<Item> &items, int capacity, uint32_t nThreads) 
 {
-    int n = items.size();
+    // num items
+    uint32_t n = items.size();
 
     // dynamic programing table
-    //std::vector<std::vector<int>> dp;
-    int *dp;
-
-    // Create a barrier
-    CustomBarrier barrier(nThreads);
+    int* dp = new int[(n+1) * (capacity+1)]();
 
     // Create threads
     std::vector<std::thread> threads(nThreads);
-    std::vector<int> start(nThreads);
-    std::vector<int> end(nThreads);
-    std::vector<double> times(nThreads, 0);
 
-    int itemsPerThread;
-    int remainder;
+    // initializing thread data objects
+    std::vector<ThreadData> data(nThreads);
 
-    // We will chose to change how we iterate through the DP table based on spatial locality access.
-    // rows are items, columns are weights
-    if(capacity < n)
+    // initialize rowcheck 
+    std::atomic<int>** rowCheck = new std::atomic<int>*[n+1];
+    
+    for(int i = 0; i < n+1; i++)
     {
-        //dp = std::vector< std::vector< int >> (capacity+1, std::vector< int >(n+1, 0));
-        dp = new int[(capacity+1) * (n+1)]();
-        itemsPerThread = n / nThreads;
-        remainder = n % nThreads;
+        rowCheck[i] = new std::atomic<int>[nThreads]();
     }
-    // columns are items, rows are weights. 
-    else
-    {
-        //dp = std::vector< std::vector< int >> (n+1, std::vector< int >(capacity+1, 0));
-        dp = new int[(n+1) * (capacity+1)]();
-        itemsPerThread = capacity / nThreads;
-        remainder = capacity % nThreads;
-    }
-
+    
     // Divide work among threads
-    for (uint32_t i = 0; i < nThreads; i++)
-    {
-        if(i == 0)
-        {
-            start[i] = 1;
-            end[i] = nThreads > 1 ? itemsPerThread + remainder: itemsPerThread;
-        }
-        else
-        {
-            if(nThreads <= n)
-            {
-                start[i] = end[i-1] + 1;
-                end[i] = start[i] + itemsPerThread - 1;
+    uint32_t itemsPerThread = capacity / nThreads;
+    uint32_t remainder = capacity % nThreads;
+    
+    data[0].start = 1;
+    data[0].end = data[0].start + itemsPerThread - 1;
 
-                if(capacity < n)
-                {
-                    if(end[i] > n)  // Cap end[i] to 'n'
-                    {
-                        end[i] = n;
-                    }
-                }
-            }
-            else
-            {
-                start[i] = 1;
-                end[i] = 0;
-            }
+    for (uint32_t i = 1; i < nThreads; i++)
+    {
+        data[i].start = data[i-1].end + 1;
+        data[i].end = data[i].start + itemsPerThread - 1;
+
+        if(remainder >= 1)
+        {
+            data[i].end += 1;
+            remainder--;
         }
     }
 
-    // Time the execution
+    // Begin execution timer:
     timer t;
     t.start();
     
-    if(capacity < n)
+    // ########################### PARALLEL CODE BEGINS ###########################
+    for (uint32_t i = 0; i < nThreads; i++)
     {
-        for (uint32_t i = 0; i < nThreads; i++)
-        {
-            threads[i] = std::thread(
-                column_knapsack_function, 
-                std::ref(items), 
-                capacity, 
-                std::ref(dp), 
-                start[i], 
-                end[i], 
-                std::ref(barrier), 
-                &times[i], 
-                i, 
-                nThreads
-            );
-        }
+        data[i].dp = dp;
+        data[i].items = &items;
+        data[i].rowCheck = &rowCheck;
+        data[i].capacity = capacity;
+        data[i].id = i;
+
+        threads[i] = std::thread(
+            parallel_knapsack_function, 
+            &data[i]
+        );
     }
-    else
-    {
-        for (uint32_t i = 0; i < nThreads; i++)
-        {
-            threads[i] = std::thread(
-                row_knapsack_function, 
-                std::ref(items), 
-                capacity, 
-                std::ref(dp), 
-                start[i], 
-                end[i], 
-                std::ref(barrier), 
-                &times[i], 
-                i
-            );
-        }
-    }
+    
     // Join threads
     for (uint32_t i = 0; i < nThreads; i++)
     {
         threads[i].join();
     }
-
+    // ############################ PARALLEL CODE ENDS ############################
+    
+    // End timer
     double runtime = t.stop();
 
+    // Print statistics
     std::cout << "Thread ID --- Runtime (s)"  << std::endl;
-
     for (uint32_t i = 0; i < nThreads; i++)
     {
-        std::cout << std::setw(9) << i << " --- " << std::setw(11) << times[i] << std::endl;
+        std::cout << std::setw(9) << i << " --- " << std::setw(11) << data[i].time << std::endl;
     }
 
+    // load final value
+    int final_value = dp[n * (capacity+1) + capacity];
     
-    int final_value;
-    if(capacity < n)
-    {
-        final_value = DP_COL(capacity, n);
-    }
-    else
-    {
-        final_value = DP_ROW(n, capacity);
-    }
-
-    delete[] dp;
-
-    
+    // print total runtime and max value.
     std::cout << "\nMaximum value achievable: " << final_value << std::endl;
     std::cout << "Total runtime: " << runtime << " seconds" << std::endl;
 
-    return final_value;
+    // memory leak prevention
+    delete[] dp;
 
-    /*
-    if(capacity < n)
-    {
-        return dp[capacity][n];
-    }
-    else
-    {
-        return dp[n][capacity];
-    }
-    */
+    return final_value;
 }
 
 int main(int argc, char **argv)
@@ -255,7 +167,7 @@ int main(int argc, char **argv)
     
     options.add_options()
         ("nThreads", "Number of threads", cxxopts::value<uint32_t>()->default_value("1"))
-        ("n", "Number of items", cxxopts::value<int>()->default_value("1000000"))
+        ("n", "Number of items", cxxopts::value<int>()->default_value("100000"))
         ("c", "Knapsack capacity", cxxopts::value<int>()->default_value("1000"))
         ("h,help", "Print usage")
         ("t", "Run tests", cxxopts::value< bool >()->default_value("false"));
@@ -280,7 +192,7 @@ int main(int argc, char **argv)
         std::cout << std::endl;
         std::cout << "TESTING" << std::endl;
         std::cout << std::endl;
-        test_threads(knapsack_parallel, nThreads);
+        test_threads(knapsack_parallel_setup, nThreads);
 
         return 0;
     }
@@ -298,13 +210,13 @@ int main(int argc, char **argv)
         items.push_back(Item(w, v));
     }
     
-    // Print items
-    // Print items
+
+    // Print item, thread, capacity details.
     std::cout << "\nItems available:" << n << std::endl;
     std::cout << "Knapsack capacity: " << capacity << std::endl;
     std::cout << "Number of Threads: " << nThreads << std::endl;
     
-    knapsack_parallel(items, capacity, nThreads);
+    knapsack_parallel_setup(items, capacity, nThreads);
     
     return 0;
 }
